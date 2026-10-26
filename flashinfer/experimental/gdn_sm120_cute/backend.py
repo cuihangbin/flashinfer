@@ -10,6 +10,16 @@ from typing import Any
 import torch
 
 _plans: dict[tuple, Any] = {}
+_OFFICIAL = object()
+# h_v=32 shapes slower than official FlashInfer on the measured SM120 grid.
+# Triton loses the whole grid, so it does not gate this cache.
+_SLOWER_THAN_OFFICIAL = frozenset({(4, 2048), (8, 2048), (8, 32768)})
+
+
+def _official_kernel(lengths: tuple, num_v_heads: int) -> bool:
+    if num_v_heads != 32 or len(set(lengths)) != 1:
+        return False
+    return (len(lengths), lengths[0]) in _SLOWER_THAN_OFFICIAL
 
 
 def run(q, k, v, **kwargs):
@@ -107,6 +117,13 @@ def run(q, k, v, **kwargs):
     ):
         raise ValueError("max_seqlen must bound the supplied sequence lengths")
     key = (lengths, v.shape[1], str(q.device), cu.dtype, str(use_cp))
+    if _plans.get(key) is _OFFICIAL:
+        return fallback()
+    if _official_kernel(lengths, v.shape[1]):
+        if key not in _plans and len(_plans) >= 64:
+            return fallback()
+        _plans[key] = _OFFICIAL
+        return fallback()
     if key not in _plans and len(_plans) >= 64:
         return fallback()
     from ._api import build_plan, chunk_gated_delta_rule
